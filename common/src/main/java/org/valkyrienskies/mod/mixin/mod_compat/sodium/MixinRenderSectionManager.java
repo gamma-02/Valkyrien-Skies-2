@@ -1,19 +1,23 @@
 package org.valkyrienskies.mod.mixin.mod_compat.sodium;
 
-import it.unimi.dsi.fastutil.PriorityQueue;
-import it.unimi.dsi.fastutil.objects.ObjectList;
+import java.util.ArrayDeque;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.WeakHashMap;
-import me.jellysquid.mods.sodium.client.render.chunk.ChunkRenderList;
+import me.jellysquid.mods.sodium.client.render.chunk.ChunkRenderer;
 import me.jellysquid.mods.sodium.client.render.chunk.ChunkUpdateType;
-import me.jellysquid.mods.sodium.client.render.chunk.RegionChunkRenderer;
 import me.jellysquid.mods.sodium.client.render.chunk.RenderSection;
 import me.jellysquid.mods.sodium.client.render.chunk.RenderSectionManager;
-import me.jellysquid.mods.sodium.client.render.chunk.data.ChunkRenderBounds;
-import me.jellysquid.mods.sodium.client.util.frustum.Frustum;
+import me.jellysquid.mods.sodium.client.render.chunk.lists.SortedRenderLists;
+import me.jellysquid.mods.sodium.client.render.viewport.Viewport;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.LevelChunkSection;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.joml.primitives.AABBd;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -31,10 +35,10 @@ import org.valkyrienskies.mod.mixinducks.mod_compat.sodium.RenderSectionManagerD
 public abstract class MixinRenderSectionManager implements RenderSectionManagerDuck {
 
     @Unique
-    private final WeakHashMap<ClientShip, ChunkRenderList> shipRenderLists = new WeakHashMap<>();
+    private final WeakHashMap<ClientShip, SortedRenderLists> shipRenderLists = new WeakHashMap<>();
 
     @Override
-    public WeakHashMap<ClientShip, ChunkRenderList> getShipRenderLists() {
+    public WeakHashMap<ClientShip, SortedRenderLists> getShipRenderLists() {
         return shipRenderLists;
     }
 
@@ -43,32 +47,27 @@ public abstract class MixinRenderSectionManager implements RenderSectionManagerD
     private ClientLevel world;
     @Shadow
     @Final
-    private ObjectList<RenderSection> tickableChunks;
+    private ChunkRenderer chunkRenderer;
     @Shadow
-    @Final
-    private RegionChunkRenderer chunkRenderer;
-    @Shadow
-    @Final
-    private Map<ChunkUpdateType, PriorityQueue<RenderSection>> rebuildQueues;
-    @Shadow
-    private float cameraX;
-    @Shadow
-    private float cameraY;
-    @Shadow
-    private float cameraZ;
+    private @NotNull Map<ChunkUpdateType, ArrayDeque<RenderSection>> rebuildLists;
+
 
     @Shadow
     protected abstract RenderSection getRenderSection(int x, int y, int z);
 
+
     @Shadow
-    protected abstract void addEntitiesToRenderLists(RenderSection render);
+    private @NotNull SortedRenderLists renderLists;
 
     @Shadow
     @Final
-    private static double NEARBY_CHUNK_DISTANCE;
+    private static float NEARBY_REBUILD_DISTANCE;
 
-    @Inject(at = @At("TAIL"), method = "iterateChunks")
-    private void afterIterateChunks(final Camera camera, final Frustum frustum, final int frame,
+    @Shadow
+    private @Nullable BlockPos lastCameraPosition;
+
+    @Inject(at = @At("TAIL"), method = "update")
+    private void afterIterateChunks(final Camera camera, final Viewport viewport, final int frame,
         final boolean spectator, final CallbackInfo ci) {
         for (final ClientShip ship : VSGameUtilsKt.getShipObjectWorld(Minecraft.getInstance()).getLoadedShips()) {
             ship.getActiveChunksSet().forEach((x, z) -> {
@@ -80,30 +79,49 @@ public abstract class MixinRenderSectionManager implements RenderSectionManagerD
                     }
 
                     if (section.getPendingUpdate() != null) {
-                        final PriorityQueue<RenderSection> queue = this.rebuildQueues.get(section.getPendingUpdate());
+                        final ArrayDeque<RenderSection> queue = this.rebuildLists.get(section.getPendingUpdate());
                         if (queue.size() < (2 << 4) - 1) {
-                            queue.enqueue(section);
+                            queue.push(section);
                         }
                     }
 
-                    final ChunkRenderBounds b = section.getBounds();
-                    final AABBd b2 = new AABBd(b.x1 - 6e-1, b.y1 - 6e-1, b.z1 - 6e-1,
-                        b.x2 + 6e-1, b.y2 + 6e-1, b.z2 + 6e-1)
+
+
+//                    final ChunkRenderBounds b = section.getInfo;
+                    int x1 = section.getOriginX();
+                    int y1 = section.getOriginY();
+                    int z1 = section.getOriginZ();
+                    int x2 = x1 + 16;
+                    int y2 = y1 + 16;
+                    int z2 = z1 + 16;
+
+                    final AABBd b2 = new AABBd(x1 - 6e-1, y1 - 6e-1, z1 - 6e-1,
+                        x2 + 6e-1, y2 + 6e-1, z2 + 6e-1)
                         .transform(ship.getRenderTransform().getShipToWorld());
 
-                    if (section.isEmpty() ||
-                        !frustum.isBoxVisible((float) b2.minX, (float) b2.minY, (float) b2.minZ,
-                            (float) b2.maxX, (float) b2.maxY, (float) b2.maxZ)) {
+
+                    //works???
+                    shipRenderLists.computeIfAbsent(ship, k -> {
+                        var list = new SortedRenderLists.Builder(frame);
+                        list.add(section);
+                        return list.build();
+                    });
+
+                    LevelChunk chunk = world.getChunk(section.getChunkX(), section.getChunkZ());
+                    LevelChunkSection chunkSection = chunk.getSections()[this.world.getSectionIndex(y)];
+
+
+                    if (chunkSection.hasOnlyAir() ||
+                        !viewport.isBoxVisible(x1, y1, z1,
+                            8.0f)) {
                         continue;
                     }
 
-                    shipRenderLists.computeIfAbsent(ship, k -> new ChunkRenderList()).add(section);
 
-                    if (section.isTickable()) {
-                        tickableChunks.add(section);
-                    }
 
-                    addEntitiesToRenderLists(section);
+
+                    //removing for now, unsure...
+//                    addEntitiesToRenderLists(section);
                 }
             });
         }
@@ -112,18 +130,25 @@ public abstract class MixinRenderSectionManager implements RenderSectionManagerD
     @Redirect(
         at = @At(
             value = "INVOKE",
-            target = "Lme/jellysquid/mods/sodium/client/render/chunk/RenderSectionManager;isChunkPrioritized(Lme/jellysquid/mods/sodium/client/render/chunk/RenderSection;)Z"
+            target = "Lme/jellysquid/mods/sodium/client/render/chunk/RenderSectionManager;shouldPrioritizeRebuild(Lme/jellysquid/mods/sodium/client/render/chunk/RenderSection;)Z"
         ),
         method = "scheduleRebuild"
     )
     private boolean redirectIsChunkPrioritized(final RenderSectionManager instance, final RenderSection render) {
         return VSGameUtilsKt.squaredDistanceBetweenInclShips(world,
             render.getOriginX() + 8, render.getOriginY() + 8, render.getOriginZ() + 8,
-            this.cameraX, this.cameraY, this.cameraZ) <= NEARBY_CHUNK_DISTANCE;
+            this.lastCameraPosition.getX(), this.lastCameraPosition.getX(), this.lastCameraPosition.getX()) <= NEARBY_REBUILD_DISTANCE;
     }
 
-    @Inject(at = @At("TAIL"), method = "resetLists")
+    @Inject(at = @At("TAIL"), method = "resetRenderLists")
     private void afterResetLists(final CallbackInfo ci) {
-        shipRenderLists.values().forEach(ChunkRenderList::clear);
+            shipRenderLists.values().forEach((renderList) ->{
+            final Iterator var1 = renderList.iterator();
+
+            while(var1.hasNext()) {
+                ArrayDeque list = (ArrayDeque)var1.next();
+                list.clear();
+            }
+        });
     }
 }
